@@ -364,6 +364,27 @@ enum Vtl2DeviceState {
     Reconfiguring,
 }
 
+impl Vtl2DeviceState {
+    async fn device_enumerated(
+        &mut self,
+        is_shutdown_active: bool,
+        report_bound: impl AsyncFnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<bool> {
+        if is_shutdown_active {
+            return Ok(false);
+        }
+
+        match self {
+            Self::Missing => *self = Self::DeviceEnumerated,
+            // A uevent may have already started the device as a surprise add,
+            // skipping the bind report that the host now expects.
+            Self::Present => report_bound().await?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+}
+
 enum WorkerControlFlow {
     Continue,
     ExitWorker,
@@ -1397,7 +1418,7 @@ impl HclNetworkVFManagerWorker {
                 // VPCI bus events determine when the MANA device has been Removed.
                 let device_change = self.vtl2_bus_control.notifier().map(|device| match device {
                     VpciBusEvent::DeviceEnumerated => {
-                        tracing::info!(vtl2_vfid, "MANA device enumerated, waiting for uevent.");
+                        tracing::info!(vtl2_vfid, "MANA device enumerated");
                         NextWorkItem::ManaDeviceEnumerated
                     }
                     VpciBusEvent::PrepareForRemoval => {
@@ -1488,17 +1509,24 @@ impl HclNetworkVFManagerWorker {
             match next_work_item {
                 NextWorkItem::Continue => continue,
                 NextWorkItem::ManaDeviceEnumerated => {
-                    if !self.is_shutdown_active
-                        && matches!(vtl2_device_state, Vtl2DeviceState::Missing)
+                    match vtl2_device_state
+                        .device_enumerated(self.is_shutdown_active, async || {
+                            self.update_vtl2_device_bind_state(true).await
+                        })
+                        .await
                     {
-                        vtl2_device_state = Vtl2DeviceState::DeviceEnumerated;
-                    } else {
-                        tracing::warn!(
+                        Ok(true) => {}
+                        Ok(false) => tracelimit::warn_ratelimited!(
                             vtl2_vfid,
                             vtl2_device_state = ?vtl2_device_state,
                             shutdown_active = self.is_shutdown_active,
                             "ignoring VPCI DeviceEnumerated notification, invalid device state"
-                        );
+                        ),
+                        Err(err) => tracelimit::error_ratelimited!(
+                            vtl2_vfid,
+                            err = err.as_ref() as &dyn std::error::Error,
+                            "Failed to report new binding state to host"
+                        ),
                     }
                 }
                 NextWorkItem::ManagerMessage(message) => {
@@ -2264,5 +2292,104 @@ mod save_restore {
                 hidden_vtl0,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Vtl2DeviceState;
+    use futures::FutureExt;
+    use test_with_tracing::test;
+
+    #[test]
+    fn device_enumerated_before_arrival() {
+        let mut state = Vtl2DeviceState::Missing;
+        let mut reported = false;
+        let handled = state
+            .device_enumerated(false, async || {
+                reported = true;
+                Ok(())
+            })
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        assert!(handled);
+        assert_eq!(state, Vtl2DeviceState::DeviceEnumerated);
+        assert!(!reported);
+    }
+
+    #[test]
+    fn device_enumerated_after_arrival_reports_bound() {
+        let mut state = Vtl2DeviceState::Present;
+        let mut reported = false;
+        let handled = state
+            .device_enumerated(false, async || {
+                reported = true;
+                Ok(())
+            })
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        assert!(handled);
+        assert_eq!(state, Vtl2DeviceState::Present);
+        assert!(reported);
+    }
+
+    #[test]
+    fn device_enumerated_during_shutdown() {
+        for initial_state in [
+            Vtl2DeviceState::Missing,
+            Vtl2DeviceState::DeviceEnumerated,
+            Vtl2DeviceState::Present,
+            Vtl2DeviceState::Reconfiguring,
+        ] {
+            let mut state = initial_state;
+            let mut reported = false;
+            let handled = state
+                .device_enumerated(true, async || {
+                    reported = true;
+                    Ok(())
+                })
+                .now_or_never()
+                .unwrap()
+                .unwrap();
+            assert!(!handled);
+            assert_eq!(state, initial_state);
+            assert!(!reported);
+        }
+    }
+
+    #[test]
+    fn device_enumerated_invalid_state() {
+        for initial_state in [
+            Vtl2DeviceState::DeviceEnumerated,
+            Vtl2DeviceState::Reconfiguring,
+        ] {
+            let mut state = initial_state;
+            let mut reported = false;
+            let handled = state
+                .device_enumerated(false, async || {
+                    reported = true;
+                    Ok(())
+                })
+                .now_or_never()
+                .unwrap()
+                .unwrap();
+            assert!(!handled);
+            assert_eq!(state, initial_state);
+            assert!(!reported);
+        }
+    }
+
+    #[test]
+    fn device_enumerated_report_failure() {
+        let mut state = Vtl2DeviceState::Present;
+        let error = state
+            .device_enumerated(false, async || anyhow::bail!("test binding report failure"))
+            .now_or_never()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.to_string(), "test binding report failure");
+        assert_eq!(state, Vtl2DeviceState::Present);
     }
 }
